@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    PoseClass,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -81,6 +82,7 @@ from ultralytics.utils.loss import (
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
+    v8PoseClassLoss,
     v8PoseLoss,
     v8SegmentationLoss,
 )
@@ -690,6 +692,19 @@ class ClassificationModel(BaseModel):
         """Initialize the loss criterion for the ClassificationModel."""
         return v8ClassificationLoss()
 
+class PoseClassModel(ClassificationModel):
+    """YOLO PoseClass model built on classification pipeline."""
+
+    def __init__(self, cfg="yolov8-pose-cls2.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)
+        if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
+            cfg["kpt_shape"] = data_kpt_shape
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the PoseClassModel."""
+        return v8PoseClassLoss(self)
 
 class RTDETRDetectionModel(DetectionModel):
     """RTDETR (Real-time DEtection and Tracking using Transformers) Detection Model class.
@@ -1548,6 +1563,7 @@ def parse_model(d, ch, verbose=True):
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
+            PoseClass,
             Classify,
             Conv,
             ConvTranspose,
@@ -1604,6 +1620,8 @@ def parse_model(d, ch, verbose=True):
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        if m == "PoseClassify":  # YAML alias for PoseClass single-feature head
+            m = "PoseClass"
         m = (
             getattr(torch.nn, m[3:])
             if "nn." in m
@@ -1756,6 +1774,8 @@ def guess_model_task(model):
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
         m = cfg["head"][-1][-2].lower()  # output module name
+        if "poseclass" in m:
+            return "poseclass"
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
         if "detect" in m:
@@ -1782,6 +1802,8 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
+            elif isinstance(m, PoseClass):
+                return "poseclass"
             elif isinstance(m, Classify):
                 return "classify"
             elif isinstance(m, Pose):
@@ -1796,6 +1818,8 @@ def guess_model_task(model):
         model = Path(model)
         if "-seg" in model.stem or "segment" in model.parts:
             return "segment"
+        elif "-poseclass" in model.stem or "poseclass" in model.parts:
+            return "poseclass"
         elif "-cls" in model.stem or "classify" in model.parts:
             return "classify"
         elif "-pose" in model.stem or "pose" in model.parts:

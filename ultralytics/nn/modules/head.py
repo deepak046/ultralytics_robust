@@ -20,7 +20,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "PoseClass",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -810,6 +821,39 @@ class Classify(nn.Module):
             return x
         y = x.softmax(1)  # get final output
         return y if self.export else (y, x)
+
+
+class PoseClass(Classify):
+    """Single-head pose + classification module on one crop feature tensor."""
+
+    def __init__(self, c1: int, c2: int, kpt_shape: tuple = (17, 3), k: int = 1, s: int = 1, p: int | None = None, g: int = 1):
+        """Initialize shared trunk + cls logits and keypoint regression branches.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output classes for classification.
+            kpt_shape (tuple): Number of keypoints and dims, e.g. (17, 3).
+            k (int, optional): Kernel size of the shared stem convolution.
+            s (int, optional): Stride of the shared stem convolution.
+            p (int, optional): Padding of the shared stem convolution.
+            g (int, optional): Groups of the shared stem convolution.
+        """
+        super().__init__(c1=c1, c2=c2, k=k, s=s, p=p, g=g)
+        self.kpt_shape = tuple(kpt_shape)
+        self.nk = self.kpt_shape[0] * self.kpt_shape[1]
+        self.pose = nn.Linear(self.linear.in_features, self.nk)
+
+    def forward(self, x: list[torch.Tensor] | torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return class logits/probabilities and keypoint predictions from one feature tensor."""
+        if isinstance(x, list):
+            x = torch.cat(x, 1)
+        feat = self.drop(self.pool(self.conv(x)).flatten(1))
+        cls_logits = self.linear(feat)
+        kpts = self.pose(feat).view(-1, *self.kpt_shape)
+        if self.training:
+            return {"cls_logits": cls_logits, "kpts": kpts}
+        cls = cls_logits.softmax(1)
+        return {"cls": cls, "cls_logits": cls_logits, "kpts": kpts}
 
 
 class WorldDetect(Detect):

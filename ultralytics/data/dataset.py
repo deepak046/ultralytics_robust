@@ -108,7 +108,7 @@ class YOLODataset(BaseDataset):
             )
         with ThreadPool(NUM_THREADS) as pool:
             results = pool.imap(
-                func=verify_image_label,
+                func=verify_image_label, # TODO: Deepak | Label format is verified here - check func. def.
                 iterable=zip(
                     self.im_files,
                     self.label_files,
@@ -169,6 +169,7 @@ class YOLODataset(BaseDataset):
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
             assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            # TODO: Deepak | Label cache is created here - labels are verified here
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
         # Display cache

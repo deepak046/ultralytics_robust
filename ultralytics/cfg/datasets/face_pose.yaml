@@ -1,0 +1,10 @@
+# TODO: Deepak | Face pose dataset YAML file
+path: /abs/path/to/dataset_root
+train: images/train
+val: images/val
+
+nc: 5
+names: [front, left, right, up, down]
+
+kpt_shape: [7, 3]
+flip_idx: [0, 1, 2, 3, 4, 5, 6]  # adapt to your keypoint symmetry

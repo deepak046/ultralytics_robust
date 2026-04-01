@@ -1,0 +1,20 @@
+# TODO: Deepak | PoseClass training parameters YAML file
+task: poseclass
+mode: train
+
+model: ultralytics_robust/cfg/models/v8/yolov8-poseclass.yaml
+data: ultralytics_robust/cfg/datasets/facepose_poseclass_data.yaml
+
+epochs: 100
+imgsz: 224
+batch: 32
+workers: 8
+device: 0
+
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+
+project: runs/poseclass
+name: exp01
+exist_ok: true

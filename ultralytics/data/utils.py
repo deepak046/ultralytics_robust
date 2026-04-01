@@ -178,6 +178,7 @@ def verify_image(args: tuple) -> tuple:
 
 
 def verify_image_label(args: tuple) -> list:
+    # TODO: Deepak | Label format is verified here - add 'cls2' here
     """Verify one image-label pair."""
     im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, single_cls = args
     # Number (missing, found, empty, corrupt), message, segments, keypoints
