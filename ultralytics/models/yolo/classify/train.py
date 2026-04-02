@@ -59,7 +59,8 @@ class ClassificationTrainer(BaseTrainer):
         """
         if overrides is None:
             overrides = {}
-        overrides["task"] = "classify"
+        # Preserve specialized tasks (e.g. poseclass) set by child trainers.
+        overrides.setdefault("task", "classify")
         if overrides.get("imgsz") is None:
             overrides["imgsz"] = 224
         super().__init__(cfg, overrides, _callbacks)

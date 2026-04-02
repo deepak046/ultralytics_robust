@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from ultralytics.data.augment import classify_transforms
+from ultralytics.engine.predictor import BasePredictor
 from ultralytics.models.yolo.classify.predict import ClassificationPredictor
 from ultralytics.engine.results import Results
 from ultralytics.utils import DEFAULT_CFG, ops
@@ -13,6 +15,16 @@ class PoseClassPredictor(ClassificationPredictor):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         super().__init__(cfg, overrides, _callbacks)
         self.args.task = "poseclass"
+
+    def setup_source(self, source):
+        """Set up source and robust classify transforms for PoseClass models."""
+        # Skip ClassificationPredictor.setup_source(), which assumes model.model.transforms exists.
+        BasePredictor.setup_source(self, source)
+        model_tf = getattr(getattr(self.model, "model", None), "transforms", None)
+        if model_tf is not None and self.model.pt:
+            self.transforms = model_tf
+        else:
+            self.transforms = classify_transforms(self.imgsz)
 
     def postprocess(self, preds, img, orig_imgs):
         """Process model outputs into Results objects with probs and keypoints."""

@@ -60,6 +60,7 @@ TASK2DATA = {
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
+    "poseclass": "coco8-pose.yaml",
 }
 TASK2MODEL = {
     "detect": "yolo26n.pt",
@@ -74,6 +75,7 @@ TASK2METRIC = {
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
+    "poseclass": "metrics/mAP50-95(P)",
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []

@@ -33,6 +33,7 @@ from .base import BaseDataset
 from .converter import merge_multi_segment
 from .utils import (
     HELP_URL,
+    IMG_FORMATS,
     check_file_speeds,
     get_hash,
     img2label_paths,
@@ -833,3 +834,174 @@ class ClassificationDataset:
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
             return samples
+
+
+class PoseClassDataset:
+    """Dataset for poseclass training with labels: cls kpx1 kpy1 vis1 ... kpxN kpyN visN."""
+
+    def __init__(self, root: str, args, data: dict, augment: bool = False, prefix: str = ""):
+        self.root = Path(root)
+        self.args = args
+        self.data = data
+        self.augment = augment
+        self.prefix = colorstr(f"{prefix}: ") if prefix else ""
+
+        kpt_shape = data.get("kpt_shape", (0, 0))
+        self.nkpt, self.kpt_dim = int(kpt_shape[0]), int(kpt_shape[1])
+        if self.nkpt <= 0 or self.kpt_dim not in {2, 3}:
+            raise ValueError(
+                "'kpt_shape' in data yaml must be [num_keypoints, dims], e.g. [7, 3] for cls + x y vis keypoints."
+            )
+
+        self.samples = self._scan_samples()
+        self.albu_transform = self._build_poseclass_transform()
+
+    def _build_poseclass_transform(self):
+        """Build keypoint-aware image augmentations for poseclass samples."""
+        try:
+            import albumentations as A
+            from albumentations.pytorch import ToTensorV2
+        except ImportError as e:
+            raise ImportError(
+                "PoseClassDataset requires albumentations for synchronized image/keypoint augmentation."
+            ) from e
+
+        size = int(self.args.imgsz)
+        transforms = []
+        if self.augment:
+            scale = float(getattr(self.args, "scale", 0.0))
+            translate = float(getattr(self.args, "translate", 0.0))
+            degrees = float(getattr(self.args, "degrees", 0.0))
+            shear = float(getattr(self.args, "shear", 0.0))
+            perspective = float(getattr(self.args, "perspective", 0.0))
+            fliplr = float(getattr(self.args, "fliplr", 0.0))
+            flipud = float(getattr(self.args, "flipud", 0.0))
+            hsv_h = float(getattr(self.args, "hsv_h", 0.0))
+            hsv_s = float(getattr(self.args, "hsv_s", 0.0))
+            hsv_v = float(getattr(self.args, "hsv_v", 0.0))
+
+            if any(x > 0 for x in (scale, translate, degrees, shear)):
+                transforms.append(
+                    A.Affine(
+                        scale=(max(0.0, 1.0 - scale), 1.0 + scale),
+                        translate_percent={"x": (-translate, translate), "y": (-translate, translate)},
+                        rotate=(-degrees, degrees),
+                        shear=(-shear, shear),
+                        p=1.0,
+                    )
+                )
+            if perspective > 0:
+                transforms.append(A.Perspective(scale=(0.0, perspective), p=0.5))
+            if fliplr > 0:
+                transforms.append(A.HorizontalFlip(p=fliplr))
+            if flipud > 0:
+                transforms.append(A.VerticalFlip(p=flipud))
+            if any(x > 0 for x in (hsv_h, hsv_s, hsv_v)):
+                transforms.append(
+                    A.ColorJitter(
+                        brightness=hsv_v,
+                        contrast=hsv_v,
+                        saturation=hsv_s,
+                        hue=min(hsv_h, 0.5),
+                        p=0.8,
+                    )
+                )
+
+        transforms.extend([A.Resize(height=size, width=size), A.Normalize(mean=(0.0, 0.0, 0.0), std=(1.0, 1.0, 1.0)), ToTensorV2()])
+        return A.Compose(
+            transforms,
+            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False, check_each_transform=False),
+        )
+
+    def _scan_samples(self) -> list[tuple[Path, Path]]:
+        files = sorted(
+            p for p in self.root.rglob("*") if p.is_file() and p.suffix[1:].lower() in IMG_FORMATS
+        )
+        samples = []
+        for im_file in files:
+            lb_file = self._img_to_label_path(im_file)
+            if lb_file.exists():
+                samples.append((im_file, lb_file))
+            else:
+                LOGGER.warning(f"{self.prefix}Missing label for image '{im_file}', skipping.")
+        if not samples:
+            raise FileNotFoundError(f"{self.prefix}No valid poseclass samples found in '{self.root}'.")
+        return samples
+
+    @staticmethod
+    def _img_to_label_path(im_file: Path) -> Path:
+        parts = list(im_file.parts)
+        if "images" in parts:
+            idx = parts.index("images")
+            parts[idx] = "labels"
+            return Path(*parts).with_suffix(".txt")
+        return im_file.parent.parent / "labels" / im_file.parent.name / f"{im_file.stem}.txt"
+
+    def _read_label(self, lb_file: Path) -> tuple[int, np.ndarray]:
+        lines = [line.strip() for line in lb_file.read_text().splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"Empty label file: {lb_file}")
+
+        vals = [float(x) for x in lines[0].split()]
+        expected = 1 + 4 + self.nkpt * self.kpt_dim # TODO: Deepak | Remove 4 for bbox
+        if len(vals) != expected:
+            raise ValueError(
+                f"Invalid label format in '{lb_file}': expected {expected} values (cls + {self.nkpt}x{self.kpt_dim}), "
+                f"got {len(vals)}."
+            )
+        cls = int(vals[0])
+        keypoints = np.array(vals[5:], dtype=np.float32).reshape(self.nkpt, self.kpt_dim)
+        return cls, keypoints
+
+    def __getitem__(self, i: int) -> dict:
+        im_file, lb_file = self.samples[i]
+        im = cv2.imread(str(im_file))
+        if im is None:
+            raise FileNotFoundError(f"Image not found or unreadable: {im_file}")
+        cls, keypoints = self._read_label(lb_file)
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        h0, w0 = im.shape[:2]
+
+        kpts_xy = keypoints[:, :2].astype(np.float32).copy()
+        normalized_in = bool(np.max(np.abs(kpts_xy)) <= 1.5)
+        if normalized_in:
+            kpts_xy[:, 0] *= w0
+            kpts_xy[:, 1] *= h0
+        vis = keypoints[:, 2].astype(np.float32).copy() if self.kpt_dim == 3 else None
+
+        transformed = self.albu_transform(image=im, keypoints=[tuple(xy) for xy in kpts_xy])
+        img = transformed["image"]
+        kpts_xy_aug = np.array(transformed["keypoints"], dtype=np.float32).reshape(self.nkpt, 2)
+        h1, w1 = int(img.shape[1]), int(img.shape[2])
+
+        if vis is not None:
+            in_frame = (kpts_xy_aug[:, 0] >= 0) & (kpts_xy_aug[:, 0] < w1) & (kpts_xy_aug[:, 1] >= 0) & (kpts_xy_aug[:, 1] < h1)
+            vis = np.where(in_frame, vis, 0.0)
+
+        if normalized_in:
+            kpts_xy_aug[:, 0] = np.clip(kpts_xy_aug[:, 0] / max(w1, 1), 0.0, 1.0)
+            kpts_xy_aug[:, 1] = np.clip(kpts_xy_aug[:, 1] / max(h1, 1), 0.0, 1.0)
+
+        keypoints_out = (
+            np.concatenate([kpts_xy_aug, vis.reshape(-1, 1)], axis=1).astype(np.float32)
+            if vis is not None
+            else kpts_xy_aug.astype(np.float32)
+        )
+        return {
+            "img": img,
+            "cls": torch.tensor(cls, dtype=torch.long),
+            "keypoints": torch.from_numpy(keypoints_out).float(),
+            "im_file": str(im_file),
+        }
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        return {
+            "img": torch.stack([b["img"] for b in batch], 0),
+            "cls": torch.stack([b["cls"] for b in batch], 0),
+            "keypoints": torch.stack([b["keypoints"] for b in batch], 0),
+            "im_file": [b["im_file"] for b in batch],
+        }
