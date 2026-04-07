@@ -964,17 +964,18 @@ class v8PoseClassLoss:
         pred_kpts = preds["kpts"]
         target_cls = batch["cls"].view(-1).to(self.device).long()
         target_kpts = batch["keypoints"].to(self.device).float()
+        pred_xy = pred_kpts[..., :2].sigmoid()
 
         cls_loss = F.cross_entropy(cls_logits, target_cls, reduction="mean")
 
         if self.kpt_shape[1] >= 3:
             visible = target_kpts[..., 2] > 0
             xy_mask = visible.unsqueeze(-1).expand(-1, -1, 2)
-            xy_diff = F.smooth_l1_loss(pred_kpts[..., :2], target_kpts[..., :2], reduction="none")
+            xy_diff = F.smooth_l1_loss(pred_xy, target_kpts[..., :2], reduction="none")
             pose_loss = (xy_diff * xy_mask).sum() / xy_mask.sum().clamp(min=1)
             kobj_loss = self.bce_pose(pred_kpts[..., 2], visible.float())
         else:
-            pose_loss = F.smooth_l1_loss(pred_kpts[..., :2], target_kpts[..., :2], reduction="mean")
+            pose_loss = F.smooth_l1_loss(pred_xy, target_kpts[..., :2], reduction="mean")
             kobj_loss = pred_kpts.sum() * 0.0
 
         pose_loss *= self.hyp.pose

@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import torch
+import torchvision.transforms as T
 
-from ultralytics.data.augment import classify_transforms
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.models.yolo.classify.predict import ClassificationPredictor
 from ultralytics.engine.results import Results
 from ultralytics.utils import DEFAULT_CFG, ops
+
+
+def _poseclass_transforms(size: int | tuple[int, int] = 224) -> T.Compose:
+    """Build inference transforms that match PoseClassDataset's validation pipeline.
+
+    Uses a direct Resize (stretch to exact size) instead of Resize-shortest-edge +
+    CenterCrop so that no part of the input image is discarded.
+    """
+    if isinstance(size, int):
+        size = (size, size)
+    return T.Compose([
+        T.Resize(size, interpolation=T.InterpolationMode.BILINEAR),
+        T.ToTensor(),
+        T.Normalize(mean=(0.0, 0.0, 0.0), std=(1.0, 1.0, 1.0)),
+    ])
 
 
 class PoseClassPredictor(ClassificationPredictor):
@@ -17,14 +32,9 @@ class PoseClassPredictor(ClassificationPredictor):
         self.args.task = "poseclass"
 
     def setup_source(self, source):
-        """Set up source and robust classify transforms for PoseClass models."""
-        # Skip ClassificationPredictor.setup_source(), which assumes model.model.transforms exists.
+        """Set up source with transforms matching PoseClass training."""
         BasePredictor.setup_source(self, source)
-        model_tf = getattr(getattr(self.model, "model", None), "transforms", None)
-        if model_tf is not None and self.model.pt:
-            self.transforms = model_tf
-        else:
-            self.transforms = classify_transforms(self.imgsz)
+        self.transforms = _poseclass_transforms(self.imgsz)
 
     def postprocess(self, preds, img, orig_imgs):
         """Process model outputs into Results objects with probs and keypoints."""
@@ -38,12 +48,22 @@ class PoseClassPredictor(ClassificationPredictor):
             raise KeyError("PoseClass predictions must contain either 'cls_logits' or 'cls'.")
         probs = cls_scores.softmax(1) if "cls_logits" in preds else cls_scores
         kpts = preds["kpts"].clone()
+        xy = kpts[..., :2]
+        if xy.min() < -0.5 or xy.max() > 1.5:
+            kpts[..., :2] = xy.sigmoid()
+        else:
+            kpts[..., :2] = xy.clamp(0.0, 1.0)
+        if kpts.shape[-1] >= 3:
+            vis = kpts[..., 2]
+            if vis.min() < -0.5 or vis.max() > 1.5:
+                kpts[..., 2] = vis.sigmoid()
+            else:
+                kpts[..., 2] = vis.clamp(0.0, 1.0)
 
         results = []
         for i, (orig_img, img_path) in enumerate(zip(orig_imgs, self.batch[0])):
-            sample_kpts = kpts[i]
-            # Convert normalized keypoint coordinates to image space if needed.
-            if sample_kpts.shape[-1] >= 2 and sample_kpts[:, :2].abs().max() <= 2.0:
+            sample_kpts = kpts[i].clone()
+            if sample_kpts[:, :2].max() <= 1.5:
                 sample_kpts[:, 0] *= orig_img.shape[1]
                 sample_kpts[:, 1] *= orig_img.shape[0]
             results.append(

@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from pathlib import Path
+
+from ultralytics.data import PoseClassDataset, build_dataloader
 from ultralytics.models.yolo.classify import ClassificationValidator
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.metrics import OKS_SIGMA, ClassifyMetrics, ConfusionMatrix, Metric, ap_per_class, kpt_iou
@@ -32,9 +35,22 @@ class PoseClassValidator(ClassificationValidator):
         self.metrics = ClassifyMetrics()
         self.pose_metric = Metric()
 
+    def build_dataset(self, img_path: str):
+        """Build PoseClassDataset instead of ClassificationDataset."""
+        return PoseClassDataset(
+            root=img_path, args=self.args, data=self.data, augment=False, prefix=self.args.split
+        )
+
+    def get_dataloader(self, dataset_path: Path | str, batch_size: int):
+        """Build dataloader backed by PoseClassDataset."""
+        dataset = self.build_dataset(str(dataset_path))
+        return build_dataloader(dataset, batch_size, self.args.workers, rank=-1)
+
     def get_desc(self) -> str:
         """Return a formatted string summarizing PoseClass metrics."""
-        return ("%22s" + "%11s" * 3) % ("classes", "top1_acc", "top5_acc", "pose_rmse")
+        return ("%22s" + "%11s" * 7) % (
+            "classes", "top1_acc", "top5_acc", "pose_rmse", "P(pose)", "R(pose)", "mAP50(P)", "mAP50-95(P)"
+        )
 
     def init_metrics(self, model: torch.nn.Module) -> None:
         """Initialize class and pose metric accumulators."""
@@ -195,15 +211,53 @@ class PoseClassValidator(ClassificationValidator):
         return stats
 
     def print_results(self) -> None:
-        """Print evaluation metrics for PoseClass."""
-        pose_rmse = float(sum(self.pose_errors) / max(len(self.pose_errors), 1))
-        p_p, r_p, map50_p, map_p = self.pose_metric.mean_results() if len(self.pose_tp) else (0.0, 0.0, 0.0, 0.0)
+        """Print per-class and overall evaluation metrics for PoseClass."""
         pf = "%22s" + "%11.3g" * 7
+        pose_rmse = float(sum(self.pose_errors) / max(len(self.pose_errors), 1))
+
+        has_pose = len(self.pose_tp) > 0
+        if has_pose:
+            p_p, r_p, map50_p, map_p = self.pose_metric.mean_results()
+        else:
+            p_p, r_p, map50_p, map_p = 0.0, 0.0, 0.0, 0.0
+
+        # Per-class classification accuracy
+        if self.nc > 1 and len(self.cls_target):
+            all_targets = torch.cat(self.cls_target).int()
+            all_top1 = torch.cat(self.cls_pred)[:, 0].int()
+            for ci in range(self.nc):
+                mask = all_targets == ci
+                n_cls = mask.sum().item()
+                if n_cls == 0:
+                    continue
+                correct = (all_top1[mask] == ci).sum().item()
+                cls_acc = correct / n_cls
+
+                if has_pose and self.pose_metric.p.shape[0] > ci:
+                    pc_p = float(self.pose_metric.p[ci].mean())
+                    pc_r = float(self.pose_metric.r[ci].mean())
+                    pc_m50 = float(self.pose_metric.ap50[ci]) if self.pose_metric.ap50.ndim == 1 else float(self.pose_metric.ap50[ci].mean())
+                    pc_m = float(self.pose_metric.ap[ci].mean()) if self.pose_metric.ap.ndim > 1 else float(self.pose_metric.ap[ci])
+                else:
+                    pc_p, pc_r, pc_m50, pc_m = 0.0, 0.0, 0.0, 0.0
+                name = self.names.get(ci, f"class_{ci}")
+                LOGGER.info(pf % (f"{name} ({n_cls})", cls_acc, 0, 0, pc_p, pc_r, pc_m50, pc_m))
+
+        # Summary row
         LOGGER.info(pf % ("all", self.metrics.top1, self.metrics.top5, pose_rmse, p_p, r_p, map50_p, map_p))
 
     def plot_val_samples(self, batch: dict[str, Any], ni: int) -> None:
-        """Plot validation image samples."""
+        """Plot validation image samples with GT keypoints scaled to pixel coords."""
+        batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         batch["batch_idx"] = torch.arange(batch["img"].shape[0])
+        if "keypoints" in batch:
+            kpts = batch["keypoints"]
+            _, _, h, w = batch["img"].shape
+            if kpts[..., :2].max() <= 1.5:
+                kpts = kpts.clone()
+                kpts[..., 0] = kpts[..., 0] * w
+                kpts[..., 1] = kpts[..., 1] * h
+                batch["keypoints"] = kpts
         plot_images(
             labels=batch,
             fname=self.save_dir / f"val_batch{ni}_labels.jpg",
@@ -218,12 +272,19 @@ class PoseClassValidator(ClassificationValidator):
         if cls_scores is None or pred_kpts is None:
             return
         probs = cls_scores.softmax(1) if "cls_logits" in preds else cls_scores
+
+        kpts_px = pred_kpts.clone()
+        _, _, h, w = batch["img"].shape
+        if kpts_px[..., :2].max() <= 1.5:
+            kpts_px[..., 0] = kpts_px[..., 0] * w
+            kpts_px[..., 1] = kpts_px[..., 1] * h
+
         batched_preds = dict(
             img=batch["img"],
             batch_idx=torch.arange(batch["img"].shape[0], device=batch["img"].device),
             cls=torch.argmax(probs, dim=1),
             conf=torch.amax(probs, dim=1),
-            keypoints=pred_kpts,
+            keypoints=kpts_px,
         )
         plot_images(
             labels=batched_preds,

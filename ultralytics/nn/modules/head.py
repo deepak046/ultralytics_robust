@@ -853,7 +853,28 @@ class PoseClass(Classify):
         if self.training:
             return {"cls_logits": cls_logits, "kpts": kpts}
         cls = cls_logits.softmax(1)
-        return {"cls": cls, "cls_logits": cls_logits, "kpts": kpts}
+        return {"cls": cls, "cls_logits": cls_logits, "kpts": self.kpts_decode(kpts)}
+
+    def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
+        """Decode PoseClass keypoints to normalized xy and visibility probability.
+
+        Applies sigmoid only when raw logits are detected (values well outside [0, 1]).
+        Models trained without sigmoid in the loss output directly in [0, 1] and must
+        not be double-squeezed.
+        """
+        y = kpts.clone()
+        xy = y[..., :2]
+        if xy.min() < -0.5 or xy.max() > 1.5:
+            y[..., :2] = xy.sigmoid()
+        else:
+            y[..., :2] = xy.clamp(0.0, 1.0)
+        if self.kpt_shape[1] >= 3:
+            vis = y[..., 2]
+            if vis.min() < -0.5 or vis.max() > 1.5:
+                y[..., 2] = vis.sigmoid()
+            else:
+                y[..., 2] = vis.clamp(0.0, 1.0)
+        return y
 
 
 class WorldDetect(Detect):
