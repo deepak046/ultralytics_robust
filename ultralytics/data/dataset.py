@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -307,6 +308,197 @@ class YOLODataset(BaseDataset):
         for i in range(len(new_batch["batch_idx"])):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
+
+
+class DriverROIDataset(YOLODataset):
+    """Dataset for end-to-end driver ROI training.
+
+    Label format per line:
+        cls cx cy w h kp1_x kp1_y kp1_v ... kpN_x kpN_y kpN_v orientation
+
+    The first 5 values follow standard YOLO detection format. Keypoints are normalized to [0, 1]
+    in image coordinates. The final value is an integer orientation class for that instance.
+    Use ``orientation = -1`` for detections that should not receive ROI supervision, e.g. passengers.
+    """
+
+    def __init__(self, *args, data: dict | None = None, task: str = "driverroi", **kwargs):
+        if data is None:
+            raise ValueError("DriverROIDataset requires dataset metadata with 'kpt_shape'.")
+        self.nkpt, self.kpt_dim = map(int, data.get("kpt_shape", (0, 0)))
+        if self.nkpt <= 0 or self.kpt_dim not in {2, 3}:
+            raise ValueError(
+                "'kpt_shape' in data.yaml must be [num_keypoints, dims], e.g. [7, 3] for DriverROIDataset."
+            )
+        super().__init__(*args, data=data, task=task, **kwargs)
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
+        """Cache labels for driver ROI data with keypoints plus orientation target."""
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        total = len(self.im_files)
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(
+                func=self._verify_image_label_driverroi,
+                iterable=zip(
+                    self.im_files,
+                    self.label_files,
+                    repeat(self.prefix),
+                    repeat(len(self.data["names"])),
+                    repeat(self.nkpt),
+                    repeat(self.kpt_dim),
+                    repeat(self.single_cls),
+                ),
+            )
+            pbar = TQDM(results, desc=desc, total=total)
+            for im_file, lb, shape, keypoints, orientations, roi_valid, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x["labels"].append(
+                        {
+                            "im_file": im_file,
+                            "shape": shape,
+                            "cls": lb[:, 0:1],
+                            "bboxes": lb[:, 1:],
+                            "segments": [],
+                            "keypoints": keypoints,
+                            "orientations": orientations,
+                            "roi_valid": roi_valid,
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
+                    )
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
+        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs
+        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    @staticmethod
+    def _verify_image_label_driverroi(args: tuple) -> list:
+        """Verify one image-label pair for driver ROI labels."""
+        im_file, lb_file, prefix, num_cls, nkpt, ndim, single_cls = args
+        nm, nf, ne, nc, msg = 0, 0, 0, 0, ""
+        keypoints, orientations, roi_valid = None, None, None
+        try:
+            im = Image.open(im_file)
+            im.verify()
+            shape = (im.height, im.width)
+            assert shape[0] > 9 and shape[1] > 9, f"image size {shape} <10 pixels"
+            assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {HELP_URL}"
+
+            if Path(lb_file).is_file():
+                nf = 1
+                with open(lb_file, encoding="utf-8") as f:
+                    rows = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                lb = np.array(rows, dtype=np.float32) if rows else np.zeros((0, 6 + nkpt * ndim), dtype=np.float32)
+                if nl := len(lb):
+                    expected = 6 + nkpt * ndim
+                    assert lb.shape[1] == expected, f"labels require {expected} columns each"
+                    points = lb[:, 1 : 5 + nkpt * ndim]
+                    assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
+                    assert lb[:, :-1].min() >= -0.01, f"negative class labels or coordinate {lb[:, :-1][lb[:, :-1] < -0.01]}"
+                    max_cls = 0 if single_cls else lb[:, 0].max()
+                    assert max_cls < num_cls, (
+                        f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
+                        f"Possible class labels are 0-{num_cls - 1}"
+                    )
+                    assert np.all(np.equal(lb[:, -1], np.floor(lb[:, -1]))), "orientation labels must be integers"
+                    assert lb[:, -1].min() >= -1, "orientation labels must be >= -1"
+                    _, i = np.unique(lb, axis=0, return_index=True)
+                    if len(i) < nl:
+                        lb = lb[i]
+                        msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
+                else:
+                    ne = 1
+            else:
+                nm = 1
+                lb = np.zeros((0, 6 + nkpt * ndim), dtype=np.float32)
+
+            if len(lb):
+                keypoints = lb[:, 5:-1].reshape(-1, nkpt, ndim)
+                if ndim == 2:
+                    kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
+                    keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)
+                orientations = lb[:, -1:].astype(np.float32)
+                roi_valid = (orientations >= 0).astype(np.float32)
+                if keypoints.shape[-1] >= 3:
+                    keypoints[..., 2] *= roi_valid
+                    keypoints[..., :2] *= roi_valid[..., None]
+                else:
+                    keypoints *= roi_valid[..., None]
+            else:
+                keypoints = np.zeros((0, nkpt, 3 if ndim == 2 else ndim), dtype=np.float32)
+                orientations = np.zeros((0, 1), dtype=np.float32)
+                roi_valid = np.zeros((0, 1), dtype=np.float32)
+            lb = lb[:, :5] if len(lb) else np.zeros((0, 5), dtype=np.float32)
+            return im_file, lb, shape, keypoints, orientations, roi_valid, nm, nf, ne, nc, msg
+        except Exception as e:
+            nc = 1
+            msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
+            return [None, None, None, None, None, None, nm, nf, ne, nc, msg]
+
+    def build_transforms(self, hyp: dict | None = None) -> Compose:
+        """Build transforms while disabling label-breaking augmentations for orientation-aware data."""
+        hyp = deepcopy(hyp)
+        hyp.mosaic = 0.0
+        hyp.mixup = 0.0
+        hyp.cutmix = 0.0
+        hyp.copy_paste = 0.0
+        hyp.fliplr = 0.0
+        hyp.flipud = 0.0
+        hyp.degrees = 0.0
+        hyp.shear = 0.0
+        hyp.perspective = 0.0
+        if self.augment:
+            transforms = v8_transforms(self, self.imgsz, hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=False,
+                return_keypoint=True,
+                return_obb=False,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                bgr=hyp.bgr if self.augment else 0.0,
+            )
+        )
+        return transforms
+
+    def update_labels_info(self, label: dict) -> dict:
+        """Preserve orientation labels alongside the standard YOLO instance payload."""
+        orientations = label.get("orientations", np.zeros((0, 1), dtype=np.float32))
+        roi_valid = label.get("roi_valid", np.zeros((0, 1), dtype=np.float32))
+        label = super().update_labels_info(label)
+        label["orientations"] = torch.from_numpy(orientations).float() if len(orientations) else torch.zeros((0, 1))
+        label["roi_valid"] = torch.from_numpy(roi_valid).float() if len(roi_valid) else torch.zeros((0, 1))
+        return label
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate samples and concatenate per-instance orientation labels."""
+        new_batch = YOLODataset.collate_fn(batch)
+        if "orientations" in batch[0]:
+            new_batch["orientations"] = torch.cat([b["orientations"] for b in batch], 0)
+        if "roi_valid" in batch[0]:
+            new_batch["roi_valid"] = torch.cat([b["roi_valid"] for b in batch], 0)
         return new_batch
 
 

@@ -13,6 +13,7 @@ from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
+    DriverROIModel,
     OBBModel,
     PoseClassModel,
     PoseModel,
@@ -115,6 +116,12 @@ class YOLO(Model):
                 "trainer": yolo.poseclass.PoseClassTrainer,
                 "validator": yolo.poseclass.PoseClassValidator,
                 "predictor": yolo.poseclass.PoseClassPredictor,
+            },
+            "driverroi": {
+                "model": DriverROIModel,
+                "trainer": yolo.driverroi.DriverROITrainer,
+                "validator": yolo.driverroi.DriverROIValidator,
+                "predictor": yolo.driverroi.DriverROIPredictor,
             },
             "obb": {
                 "model": OBBModel,

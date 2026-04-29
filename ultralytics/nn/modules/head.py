@@ -9,6 +9,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import roi_align
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
@@ -24,6 +25,7 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "DriverROI",
     "Pose",
     "PoseClass",
     "RTDETRDecoder",
@@ -862,6 +864,68 @@ class PoseClass(Classify):
         Models trained without sigmoid in the loss output directly in [0, 1] and must
         not be double-squeezed.
         """
+        y = kpts.clone()
+        xy = y[..., :2]
+        if xy.min() < -0.5 or xy.max() > 1.5:
+            y[..., :2] = xy.sigmoid()
+        else:
+            y[..., :2] = xy.clamp(0.0, 1.0)
+        if self.kpt_shape[1] >= 3:
+            vis = y[..., 2]
+            if vis.min() < -0.5 or vis.max() > 1.5:
+                y[..., 2] = vis.sigmoid()
+            else:
+                y[..., 2] = vis.clamp(0.0, 1.0)
+        return y
+
+
+class DriverROI(nn.Module):
+    """ROI Align head for driver orientation classification and facial keypoint regression."""
+
+    def __init__(
+        self,
+        c1: int,
+        num_orientations: int = 5,
+        kpt_shape: tuple[int, int] = (7, 2),
+        roi_size: int = 14,
+        hidden: int = 256,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_orientations = num_orientations
+        self.kpt_shape = tuple(kpt_shape)
+        self.nk = self.kpt_shape[0] * self.kpt_shape[1]
+        self.roi_size = (roi_size, roi_size)
+        self.stem = nn.Sequential(
+            Conv(c1, hidden, 3),
+            Conv(hidden, hidden, 3),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.drop = nn.Dropout(p=dropout, inplace=False)
+        self.orient = nn.Linear(hidden, num_orientations)
+        self.pose = nn.Linear(hidden, self.nk)
+
+    def forward(self, feat: torch.Tensor, rois: torch.Tensor, spatial_scale: float) -> dict[str, torch.Tensor] | None:
+        """Pool driver-face features and predict orientation plus keypoints."""
+        if rois is None or rois.numel() == 0:
+            return None
+        pooled = roi_align(
+            feat,
+            rois,
+            output_size=self.roi_size,
+            spatial_scale=spatial_scale,
+            sampling_ratio=-1,
+            aligned=True,
+        )
+        trunk = self.drop(self.pool(self.stem(pooled)).flatten(1))
+        cls_logits = self.orient(trunk)
+        kpts = self.pose(trunk).view(-1, *self.kpt_shape)
+        if self.training:
+            return {"cls_logits": cls_logits, "kpts": kpts, "rois": rois}
+        return {"cls": cls_logits.softmax(1), "cls_logits": cls_logits, "kpts": self.kpts_decode(kpts), "rois": rois}
+
+    def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
+        """Decode normalized keypoints in the same style as PoseClass."""
         y = kpts.clone()
         xy = y[..., :2]
         if xy.min() < -0.5 or xy.max() > 1.5:

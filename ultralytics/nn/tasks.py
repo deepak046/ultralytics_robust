@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DriverROI,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -74,13 +75,14 @@ from ultralytics.nn.modules import (
     YOLOESegment26,
     v10Detect,
 )
-from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
+from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis, nms
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
+    v8DriverROILoss,
     v8OBBLoss,
     v8PoseClassLoss,
     v8PoseLoss,
@@ -89,6 +91,7 @@ from ultralytics.utils.loss import (
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
+from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.torch_utils import (
     fuse_conv_and_bn,
     fuse_deconv_and_bn,
@@ -705,6 +708,174 @@ class PoseClassModel(ClassificationModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseClassModel."""
         return v8PoseClassLoss(self)
+
+
+class DriverROIModel(DetectionModel):
+    """YOLO detection model with an ROI stage for driver orientation and facial keypoints."""
+
+    def __init__(
+        self,
+        cfg="yolov8-driverroi.yaml",
+        ch=3,
+        nc=None,
+        num_orientations: int | None = None,
+        kpt_shape: tuple[int, int] | None = None,
+        driver_class: int | None = None,
+        roi_level: int | None = None,
+        roi_size: int | None = None,
+        driver_conf: float | None = None,
+        teacher_forcing: bool | None = None,
+        verbose=True,
+    ):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        cfg_dict = self.yaml if isinstance(self.yaml, dict) else {}
+        roi_cfg = cfg_dict.get("driver_roi", {})
+        self.driver_class = int(roi_cfg.get("driver_class", 0) if driver_class is None else driver_class)
+        self.roi_level = int(roi_cfg.get("roi_level", 1) if roi_level is None else roi_level)
+        self.roi_level = max(0, min(self.roi_level, len(self.model[-1].stride) - 1))
+        self.driver_conf = float(roi_cfg.get("driver_conf", 0.25) if driver_conf is None else driver_conf)
+        self.teacher_forcing = bool(roi_cfg.get("teacher_forcing", True) if teacher_forcing is None else teacher_forcing)
+        self.teacher_forcing_epochs = int(roi_cfg.get("teacher_forcing_epochs", 10))
+        self.current_epoch = 0
+        self.num_orientations = int(roi_cfg.get("num_orientations", 5) if num_orientations is None else num_orientations)
+        self.kpt_shape = tuple(roi_cfg.get("kpt_shape", [7, 2]) if kpt_shape is None else kpt_shape)
+        self.roi_size = int(roi_cfg.get("roi_size", 14) if roi_size is None else roi_size)
+        roi_channels = self.model[-1].cv2[self.roi_level][0].conv.in_channels
+        hidden = int(roi_cfg.get("hidden", max(128, roi_channels // 2)))
+        dropout = float(roi_cfg.get("dropout", 0.0))
+        self.driver_roi_head = DriverROI(
+            c1=roi_channels,
+            num_orientations=self.num_orientations,
+            kpt_shape=self.kpt_shape,
+            roi_size=self.roi_size,
+            hidden=hidden,
+            dropout=dropout,
+        )
+
+    def init_criterion(self):
+        """Initialize the joint detection + driver ROI loss."""
+        return v8DriverROILoss(self)
+
+    def loss(self, batch, preds=None):
+        """Compute loss while ensuring the ROI stage sees the current batch."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+        if preds is None or not isinstance(preds, dict) or "driver" not in preds:
+            preds = self.predict(batch["img"], batch=batch)
+        return self.criterion(preds, batch)
+
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None, batch=None):
+        """Run detection and then the ROI stage on the selected driver face per image."""
+        if not hasattr(self, "driver_roi_head"):
+            return super().predict(x, profile=profile, visualize=visualize, augment=augment, embed=embed)
+        det_output = super().predict(x, profile=profile, visualize=visualize, augment=augment, embed=embed)
+        if augment:
+            return {"det": det_output, "driver": None}
+        driver_output = self._forward_driver_roi(det_output, x.shape[2:], batch=batch)
+        return {"det": det_output, "driver": driver_output}
+
+    def _forward_driver_roi(self, det_output, imgsz, batch=None):
+        """Build RoIs from GT or predictions and run the secondary head."""
+        raw_det = self._extract_raw_detection(det_output)
+        feat = raw_det["feats"][self.roi_level]
+        stride = float(self.model[-1].stride[self.roi_level])
+
+        if self.training and self.use_teacher_forcing() and batch is not None:
+            roi_payload = self._build_gt_rois(batch, imgsz, feat.device)
+        else:
+            roi_payload = self._build_pred_rois(det_output, feat.device)
+        if roi_payload is None:
+            return None
+
+        roi_preds = self.driver_roi_head(feat, roi_payload["rois"], spatial_scale=1.0 / stride)
+        if roi_preds is None:
+            return None
+        roi_preds.update(roi_payload)
+        return roi_preds
+
+    def use_teacher_forcing(self) -> bool:
+        """Return whether GT RoIs should be used for the current training epoch."""
+        return self.teacher_forcing and self.current_epoch < self.teacher_forcing_epochs
+
+    def _extract_raw_detection(self, det_output):
+        """Normalize detect head outputs to the raw prediction dictionary with feature maps."""
+        if isinstance(det_output, tuple):
+            _, raw = det_output
+        else:
+            raw = det_output
+        if isinstance(raw, dict) and "one2many" in raw:
+            return raw["one2many"]
+        return raw
+
+    def _build_gt_rois(self, batch, imgsz, device):
+        """Use GT driver boxes during training for stable teacher-forced ROI supervision."""
+        if "batch_idx" not in batch or "cls" not in batch or "bboxes" not in batch:
+            return None
+        batch_idx = batch["batch_idx"].view(-1).to(device)
+        classes = batch["cls"].view(-1).to(device).long()
+        roi_valid = batch.get("roi_valid")
+        if roi_valid is not None:
+            roi_valid = roi_valid.view(-1).to(device) > 0
+        bboxes = batch["bboxes"].to(device)
+        scale = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=device, dtype=bboxes.dtype)
+        xyxy = xywh2xyxy(bboxes) * scale
+
+        rois, box_list, target_indices = [], [], []
+        bs = int(batch["img"].shape[0])
+        for image_idx in range(bs):
+            mask = (batch_idx == image_idx) & (classes == self.driver_class)
+            if roi_valid is not None:
+                mask = mask & roi_valid
+            if not mask.any():
+                continue
+            candidates = torch.nonzero(mask, as_tuple=False).view(-1)
+            areas = (xyxy[candidates, 2] - xyxy[candidates, 0]) * (xyxy[candidates, 3] - xyxy[candidates, 1])
+            best = candidates[areas.argmax()]
+            box = xyxy[best].clamp(min=0)
+            rois.append(torch.cat((torch.tensor([image_idx], device=device, dtype=box.dtype), box)))
+            box_list.append(box)
+            target_indices.append(best)
+        if not rois:
+            return None
+        return {
+            "rois": torch.stack(rois, 0),
+            "boxes": torch.stack(box_list, 0),
+            "batch_indices": torch.tensor([int(r[0].item()) for r in rois], device=device, dtype=torch.long),
+            "target_indices": torch.stack(target_indices).to(device=device, dtype=torch.long),
+        }
+
+    def _build_pred_rois(self, det_output, device):
+        """Select the top predicted driver detection per image for ROI inference."""
+        det_tensor = det_output[0] if isinstance(det_output, tuple) else det_output
+        if isinstance(det_tensor, dict):
+            return None
+        outputs = nms.non_max_suppression(
+            det_tensor,
+            conf_thres=self.driver_conf,
+            iou_thres=0.7,
+            classes=[self.driver_class],
+            agnostic=False,
+            max_det=1,
+            nc=0 if getattr(self, "task", "detect") == "detect" else len(self.names),
+            end2end=getattr(self, "end2end", False),
+        )
+        rois, box_list, batch_indices, scores = [], [], [], []
+        for image_idx, pred in enumerate(outputs):
+            if pred.shape[0] == 0:
+                continue
+            box = pred[0, :4].to(device)
+            rois.append(torch.cat((torch.tensor([image_idx], device=device, dtype=box.dtype), box)))
+            box_list.append(box)
+            batch_indices.append(image_idx)
+            scores.append(pred[0, 4].to(device))
+        if not rois:
+            return None
+        return {
+            "rois": torch.stack(rois, 0),
+            "boxes": torch.stack(box_list, 0),
+            "batch_indices": torch.tensor(batch_indices, device=device, dtype=torch.long),
+            "scores": torch.stack(scores, 0),
+        }
 
 class RTDETRDetectionModel(DetectionModel):
     """RTDETR (Real-time DEtection and Tracking using Transformers) Detection Model class.
@@ -1773,7 +1944,11 @@ def guess_model_task(model):
 
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
+        if cfg.get("task") == "driverroi":
+            return "driverroi"
         m = cfg["head"][-1][-2].lower()  # output module name
+        if "driverroi" in m:
+            return "driverroi"
         if "poseclass" in m:
             return "poseclass"
         if m in {"classify", "classifier", "cls", "fc"}:
@@ -1802,6 +1977,8 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
+            elif isinstance(m, DriverROI):
+                return "driverroi"
             elif isinstance(m, PoseClass):
                 return "poseclass"
             elif isinstance(m, Classify):
@@ -1818,6 +1995,8 @@ def guess_model_task(model):
         model = Path(model)
         if "-seg" in model.stem or "segment" in model.parts:
             return "segment"
+        elif "-driverroi" in model.stem or "driverroi" in model.parts:
+            return "driverroi"
         elif "-poseclass" in model.stem or "poseclass" in model.parts:
             return "poseclass"
         elif "-cls" in model.stem or "classify" in model.parts:
@@ -1832,6 +2011,6 @@ def guess_model_task(model):
     # Unable to determine task from model
     LOGGER.warning(
         "Unable to automatically guess model task, assuming 'task=detect'. "
-        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
+        "Explicitly define task for your model, i.e. 'task=detect', 'driverroi', 'segment', 'classify', 'pose' or 'obb'."
     )
     return "detect"  # assume detect

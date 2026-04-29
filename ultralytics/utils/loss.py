@@ -986,6 +986,91 @@ class v8PoseClassLoss:
         return total, loss_items
 
 
+class v8DriverROILoss(v8DetectionLoss):
+    """Criterion for joint detection plus driver orientation/keypoint supervision."""
+
+    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+        super().__init__(model, tal_topk=tal_topk, tal_topk2=tal_topk2)
+        self.model = model
+        self.driver_head = model.driver_roi_head
+        self.kpt_shape = self.driver_head.kpt_shape
+        self.bce_pose = nn.BCEWithLogitsLoss()
+        self.driver_orient_weight = float(getattr(self.hyp, "driver_orient", 0.5))
+        self.driver_pose_weight = float(getattr(self.hyp, "driver_pose", 1.0))
+        self.driver_kobj_weight = float(getattr(self.hyp, "driver_kobj", 0.25))
+        self.epoch = 0
+
+    def __call__(self, preds: dict[str, Any], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute detection and auxiliary driver-ROI losses."""
+        det_total, det_items = super().__call__(preds["det"], batch)
+        batch_size = batch["img"].shape[0]
+        loss = torch.zeros(3, device=self.device)  # orient, pose, kobj
+        driver_preds = preds.get("driver")
+
+        if driver_preds is not None and "target_indices" in driver_preds:
+            target_idx = driver_preds["target_indices"].long()
+            target_cls = self._get_orientation_targets(batch, target_idx)
+            target_kpts = self._get_keypoint_targets(batch, target_idx)
+            if "roi_valid" in batch:
+                valid = batch["roi_valid"].view(-1).to(self.device)[target_idx] > 0
+                if not valid.any():
+                    total = det_total + loss.sum() * batch_size
+                    return total, torch.cat((det_items, loss.detach()))
+                target_cls = target_cls[valid]
+                target_kpts = target_kpts[valid]
+                pred_logits = driver_preds["cls_logits"][valid]
+                pred_kpts = driver_preds["kpts"][valid]
+            else:
+                pred_logits = driver_preds["cls_logits"]
+                pred_kpts = driver_preds["kpts"]
+            pred_xy = pred_kpts[..., :2].sigmoid()
+
+            loss[0] = F.cross_entropy(pred_logits, target_cls, reduction="mean") * self.driver_orient_weight
+
+            if target_kpts.shape[-1] >= 3 and pred_kpts.shape[-1] >= 3:
+                visible = target_kpts[..., 2] > 0
+                xy_mask = visible.unsqueeze(-1).expand(-1, -1, 2)
+                xy_diff = F.smooth_l1_loss(pred_xy, target_kpts[..., :2], reduction="none")
+                loss[1] = (xy_diff * xy_mask).sum() / xy_mask.sum().clamp(min=1)
+                loss[2] = self.bce_pose(pred_kpts[..., 2], visible.float())
+            else:
+                loss[1] = F.smooth_l1_loss(pred_xy, target_kpts[..., :2], reduction="mean")
+
+            loss[1] *= self.driver_pose_weight
+            loss[2] *= self.driver_kobj_weight
+
+        total = det_total + loss.sum() * batch_size
+        return total, torch.cat((det_items, loss.detach()))
+
+    def update(self) -> None:
+        """Advance epoch-dependent scheduling hooks such as teacher forcing."""
+        self.epoch += 1
+        if hasattr(self.model, "current_epoch"):
+            self.model.current_epoch = self.epoch
+
+    def _get_orientation_targets(self, batch: dict[str, torch.Tensor], target_idx: torch.Tensor) -> torch.Tensor:
+        """Read driver-orientation targets from the batch using a few accepted key names."""
+        for key in ("orientations", "orientation", "head_orientation", "head_orientations"):
+            if key in batch:
+                target = batch[key].view(-1).to(self.device).long()[target_idx]
+                if (target < 0).any():
+                    raise ValueError(
+                        "DriverROI received unsupervised rows (orientation < 0) for ROI loss. "
+                        "These rows should have been filtered by roi_valid before loss computation."
+                    )
+                return target
+        raise KeyError(
+            "DriverROI training expects one of 'orientations', 'orientation', 'head_orientation', "
+            "or 'head_orientations' in the batch."
+        )
+
+    def _get_keypoint_targets(self, batch: dict[str, torch.Tensor], target_idx: torch.Tensor) -> torch.Tensor:
+        """Read driver keypoint targets from the batch."""
+        if "keypoints" not in batch:
+            raise KeyError("DriverROI training expects 'keypoints' in the batch.")
+        return batch["keypoints"].to(self.device).float()[target_idx]
+
+
 class v8OBBLoss(v8DetectionLoss):
     """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
 
