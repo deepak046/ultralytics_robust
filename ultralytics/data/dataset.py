@@ -408,9 +408,24 @@ class DriverROIDataset(YOLODataset):
                 if nl := len(lb):
                     expected = 6 + nkpt * ndim
                     assert lb.shape[1] == expected, f"labels require {expected} columns each"
-                    points = lb[:, 1 : 5 + nkpt * ndim]
-                    assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
                     assert lb[:, :-1].min() >= -0.01, f"negative class labels or coordinate {lb[:, :-1][lb[:, :-1] < -0.01]}"
+                    boxes = lb[:, 1:5]
+                    assert boxes.max() <= 1.01, f"non-normalized or out of bounds box coordinates {boxes[boxes > 1.01]}"
+                    if nkpt:
+                        raw_keypoints = lb[:, 5:-1].reshape(-1, nkpt, ndim)
+                        coords = raw_keypoints[..., :2]
+                        assert coords.max() <= 1.01, (
+                            f"non-normalized or out of bounds keypoint coordinates {coords[coords > 1.01]}"
+                        )
+                        assert coords.min() >= -0.01, (
+                            f"negative keypoint coordinates {coords[coords < -0.01]}"
+                        )
+                        if ndim >= 3:
+                            vis = raw_keypoints[..., 2]
+                            valid_vis = np.isin(vis, [0.0, 1.0, 2.0])
+                            assert valid_vis.all(), (
+                                f"invalid keypoint visibility values {np.unique(vis[~valid_vis])}"
+                            )
                     max_cls = 0 if single_cls else lb[:, 0].max()
                     assert max_cls < num_cls, (
                         f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
@@ -461,6 +476,8 @@ class DriverROIDataset(YOLODataset):
         hyp.fliplr = 0.0
         hyp.flipud = 0.0
         hyp.degrees = 0.0
+        hyp.translate = 0.0
+        hyp.scale = 0.0
         hyp.shear = 0.0
         hyp.perspective = 0.0
         if self.augment:

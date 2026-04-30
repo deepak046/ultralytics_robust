@@ -1009,20 +1009,36 @@ class v8DriverROILoss(v8DetectionLoss):
 
         if driver_preds is not None and "target_indices" in driver_preds:
             target_idx = driver_preds["target_indices"].long()
+            valid = torch.ones_like(target_idx, dtype=torch.bool, device=self.device)
+
+            # Filter out unsupervised rows (orientation < 0) before reading targets.
+            orientation_key = next(
+                (k for k in ("orientations", "orientation", "head_orientation", "head_orientations") if k in batch),
+                None,
+            )
+            if orientation_key is not None:
+                orient_all = batch[orientation_key].view(-1).to(self.device).long()
+                valid = valid & (orient_all[target_idx] >= 0)
+
+            if "roi_valid" in batch:
+                roi_valid = batch["roi_valid"].view(-1).to(self.device)
+                if roi_valid.numel() == batch["batch_idx"].numel():
+                    valid_per_target = roi_valid > 0
+                elif roi_valid.numel() == int(batch["img"].shape[0]):
+                    valid_per_target = (roi_valid > 0)[batch["batch_idx"].view(-1).long().to(self.device)]
+                else:
+                    valid_per_target = torch.ones_like(batch["batch_idx"].view(-1), dtype=torch.bool, device=self.device)
+                valid = valid & valid_per_target[target_idx]
+
+            if not valid.any():
+                total = det_total + loss.sum() * batch_size
+                return total, torch.cat((det_items, loss.detach()))
+
+            target_idx = target_idx[valid]
             target_cls = self._get_orientation_targets(batch, target_idx)
             target_kpts = self._get_keypoint_targets(batch, target_idx)
-            if "roi_valid" in batch:
-                valid = batch["roi_valid"].view(-1).to(self.device)[target_idx] > 0
-                if not valid.any():
-                    total = det_total + loss.sum() * batch_size
-                    return total, torch.cat((det_items, loss.detach()))
-                target_cls = target_cls[valid]
-                target_kpts = target_kpts[valid]
-                pred_logits = driver_preds["cls_logits"][valid]
-                pred_kpts = driver_preds["kpts"][valid]
-            else:
-                pred_logits = driver_preds["cls_logits"]
-                pred_kpts = driver_preds["kpts"]
+            pred_logits = driver_preds["cls_logits"][valid]
+            pred_kpts = driver_preds["kpts"][valid]
             pred_xy = pred_kpts[..., :2].sigmoid()
 
             loss[0] = F.cross_entropy(pred_logits, target_cls, reduction="mean") * self.driver_orient_weight

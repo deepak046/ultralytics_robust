@@ -811,17 +811,23 @@ class DriverROIModel(DetectionModel):
         """Use GT driver boxes during training for stable teacher-forced ROI supervision."""
         if "batch_idx" not in batch or "cls" not in batch or "bboxes" not in batch:
             return None
+        bs = int(batch["img"].shape[0])
         batch_idx = batch["batch_idx"].view(-1).to(device)
         classes = batch["cls"].view(-1).to(device).long()
         roi_valid = batch.get("roi_valid")
         if roi_valid is not None:
-            roi_valid = roi_valid.view(-1).to(device) > 0
+            roi_valid = roi_valid.view(-1).to(device)
+            if roi_valid.numel() == batch_idx.numel():
+                roi_valid = roi_valid > 0
+            elif roi_valid.numel() == bs:
+                roi_valid = (roi_valid > 0)[batch_idx.long()]
+            else:
+                roi_valid = None
         bboxes = batch["bboxes"].to(device)
         scale = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=device, dtype=bboxes.dtype)
         xyxy = xywh2xyxy(bboxes) * scale
 
         rois, box_list, target_indices = [], [], []
-        bs = int(batch["img"].shape[0])
         for image_idx in range(bs):
             mask = (batch_idx == image_idx) & (classes == self.driver_class)
             if roi_valid is not None:

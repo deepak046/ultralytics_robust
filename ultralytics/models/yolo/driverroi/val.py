@@ -54,7 +54,13 @@ class DriverROIValidator(DetectionValidator):
         classes = batch["cls"].view(-1).long()
         roi_valid = batch.get("roi_valid")
         if roi_valid is not None:
-            roi_valid = roi_valid.view(-1).to(batch_idx.device) > 0
+            roi_valid = roi_valid.view(-1).to(batch_idx.device)
+            if roi_valid.numel() == batch_idx.numel():
+                roi_valid = roi_valid > 0
+            elif roi_valid.numel() == int(batch["img"].shape[0]):
+                roi_valid = (roi_valid > 0)[batch_idx.long()]
+            else:
+                roi_valid = None
         pred_img_idx = self._driver_aux["batch_indices"].view(-1).tolist()
         pred_cls = self._driver_aux.get("cls_logits", self._driver_aux.get("cls"))
         pred_cls = pred_cls.argmax(1) if pred_cls is not None and pred_cls.ndim > 1 else pred_cls
