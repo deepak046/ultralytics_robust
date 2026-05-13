@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 from copy import copy
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import DriverROIModel
+from ultralytics.nn.tasks import DriverROIModel, yaml_model_load
 from ultralytics.utils import DEFAULT_CFG, RANK
+
+DRIVER_ROI_CFG_KEYS = (
+    "driver_class",
+    "num_orientations",
+    "roi_level",
+    "roi_size",
+    "driver_conf",
+    "teacher_forcing",
+    "teacher_forcing_epochs",
+)
 
 
 class DriverROITrainer(yolo.detect.DetectionTrainer):
@@ -27,10 +38,33 @@ class DriverROITrainer(yolo.detect.DetectionTrainer):
         verbose: bool = True,
     ) -> DriverROIModel:
         """Build the custom detection+ROI model and optionally load weights."""
-        model = DriverROIModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model_cfg = self._apply_driverroi_model_overrides(cfg)
+        model = DriverROIModel(model_cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
         return model
+
+    def _apply_driverroi_model_overrides(self, cfg: str | Path | dict[str, Any] | None) -> dict[str, Any] | None:
+        """Merge DriverROI model overrides from training args into the model config."""
+        if cfg is None:
+            return None
+
+        cfg_dict = deepcopy(cfg if isinstance(cfg, dict) else yaml_model_load(cfg))
+        if cfg_dict.get("task") != "driverroi":
+            return cfg_dict
+
+        roi_cfg = deepcopy(cfg_dict.get("driver_roi", {}))
+        for key in DRIVER_ROI_CFG_KEYS:
+            value = getattr(self.args, key, None)
+            if value is not None:
+                roi_cfg[key] = value
+
+        if getattr(self.args, "dropout", None) is not None:
+            roi_cfg["dropout"] = self.args.dropout
+
+        if roi_cfg:
+            cfg_dict["driver_roi"] = roi_cfg
+        return cfg_dict
 
     def get_validator(self):
         """Return validator with extra driver-ROI metrics."""

@@ -46,6 +46,18 @@ mask_ratio: 4 # (int) mask downsample ratio (segment only)
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
 
+# DriverROI
+driver_orient: 0.5 # (float) orientation loss gain (driverroi tasks)
+driver_pose: 1.0 # (float) keypoint localization loss gain (driverroi tasks)
+driver_kobj: 0.25 # (float) keypoint objectness loss gain (driverroi tasks)
+driver_class: # (int, optional) class id used to select the driver ROI
+num_orientations: # (int, optional) number of driver orientation classes
+roi_level: # (int, optional) FPN level used for ROI pooling
+roi_size: # (int, optional) ROIAlign output size for the driver head
+driver_conf: # (float, optional) confidence threshold when selecting predicted driver boxes
+teacher_forcing: # (bool, optional) use GT driver boxes for ROI supervision during early training
+teacher_forcing_epochs: # (int, optional) number of warmup epochs using GT RoIs
+
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'

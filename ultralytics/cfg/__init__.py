@@ -192,6 +192,10 @@ CFG_FRACTION_KEYS = frozenset(
         "iou",
         "fraction",
         "multi_scale",
+        "driver_orient",
+        "driver_pose",
+        "driver_kobj",
+        "driver_conf",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -207,6 +211,11 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "driver_class",
+        "num_orientations",
+        "roi_level",
+        "roi_size",
+        "teacher_forcing_epochs",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -243,6 +252,7 @@ CFG_BOOL_KEYS = frozenset(
         "simplify",
         "nms",
         "profile",
+        "teacher_forcing",
     }
 )
 
